@@ -1,0 +1,34 @@
+name: Debug APK
+
+on:
+  push:
+    branches:
+      - 'claude/move-save-button-bottom-BA5SQ'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v5
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v5
+
+      - name: Build debug APK
+        run: ./gradlew :app:assembleGenericDebug
+
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-generic-debug.apk
+          path: app/build/outputs/apk/generic/debug/app-generic-debug.apk
