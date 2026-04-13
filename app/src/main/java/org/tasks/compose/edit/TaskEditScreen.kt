@@ -19,17 +19,16 @@ import androidx.compose.material.icons.automirrored.outlined.ArrowBack
 import androidx.compose.material.icons.outlined.Clear
 import androidx.compose.material.icons.outlined.Delete
 import androidx.compose.material.icons.outlined.Save
-import androidx.compose.material3.Button
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FabPosition
+import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
-import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
-import androidx.compose.ui.unit.dp
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -163,30 +162,24 @@ fun TaskEditScreen(
                 },
             )
         },
-        bottomBar = {
-            Column {
-                if (!viewState.isReadOnly) {
-                    Button(
-                        onClick = save,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(horizontal = 16.dp, vertical = 8.dp)
-                    ) {
-                        Icon(
-                            imageVector = Icons.Outlined.Save,
-                            contentDescription = null,
-                            modifier = Modifier.padding(end = 8.dp)
-                        )
-                        Text(stringResource(R.string.save))
-                    }
-                }
-                if (viewState.showComments && !viewState.isReadOnly) {
-                    AndroidFragment<CommentBarFragment>(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(WindowInsets.navigationBars.asPaddingValues())
+        floatingActionButton = {
+            if (!viewState.isReadOnly) {
+                FloatingActionButton(onClick = save) {
+                    Icon(
+                        imageVector = Icons.Outlined.Save,
+                        contentDescription = stringResource(R.string.save)
                     )
                 }
+            }
+        },
+        floatingActionButtonPosition = FabPosition.End,
+        bottomBar = {
+            if (viewState.showComments && !viewState.isReadOnly) {
+                AndroidFragment<CommentBarFragment>(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(WindowInsets.navigationBars.asPaddingValues())
+                )
             }
         },
     ) { paddingValues ->
