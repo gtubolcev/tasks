@@ -1,0 +1,27 @@
+name: Debug APK
+
+on:
+  push:
+    branches:
+      - 'ccr-1bc81eb6-sz9bnv'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: ./.github/actions/setup-gradle
+
+      - name: Build debug APK
+        run: ./gradlew :app:assembleGenericDebug
+
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v7
+        with:
+          name: app-generic-debug.apk
+          path: app/build/outputs/apk/generic/debug/app-generic-debug.apk

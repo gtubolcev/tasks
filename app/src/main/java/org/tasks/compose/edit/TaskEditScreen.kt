@@ -18,6 +18,8 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.DisplayMode
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FabPosition
+import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -156,23 +158,11 @@ fun TaskEditScreen(
                     containerColor = MaterialTheme.colorScheme.background,
                 ),
                 navigationIcon = {
-                    if (viewState.isReadOnly) {
-                        IconButton(onClick = { onBackPressed() }) {
-                            SymbolIcon(
-                                name = TasksIcons.ARROW_BACK,
-                                contentDescription = stringResource(R.string.back)
-                            )
-                        }
-                    } else {
-                        IconButton(
-                            onClick = { save() },
-                            modifier = Modifier.testTag(TestTags.SAVE_TASK),
-                        ) {
-                            SymbolIcon(
-                                name = TasksIcons.SAVE,
-                                contentDescription = stringResource(R.string.save)
-                            )
-                        }
+                    IconButton(onClick = { onBackPressed() }) {
+                        SymbolIcon(
+                            name = TasksIcons.ARROW_BACK,
+                            contentDescription = stringResource(R.string.back)
+                        )
                     }
                 },
                 title = {},
@@ -203,6 +193,20 @@ fun TaskEditScreen(
                 },
             )
         },
+        floatingActionButton = {
+            if (!viewState.isReadOnly) {
+                FloatingActionButton(
+                    onClick = save,
+                    modifier = Modifier.testTag(TestTags.SAVE_TASK),
+                ) {
+                    SymbolIcon(
+                        name = TasksIcons.SAVE,
+                        contentDescription = stringResource(R.string.save)
+                    )
+                }
+            }
+        },
+        floatingActionButtonPosition = FabPosition.End,
         bottomBar = {
             if (viewState.showComments && !viewState.isReadOnly) {
                 AndroidFragment<CommentBarFragment>(
