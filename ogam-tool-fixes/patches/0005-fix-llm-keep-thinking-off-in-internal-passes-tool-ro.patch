@@ -1,0 +1,80 @@
+From 7f4c4da59ca055c5397349c55160ecaf9712c483 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 11 Nov 2026 11:25:40 +0000
+Subject: [PATCH 5/6] fix(llm): keep thinking off in internal passes (tool
+ routing, summary)
+
+generateWithMaxTokens sent no thinking params, so llama.rn's default
+enable_thinking=true applied. A reasoning model then spent the whole budget
+inside <think>: 64 tokens for the on-device tool-routing pass, which then
+named no tool and fell back to built-in tools only, and the summary budget for
+context compaction. Send the same hard-off params as Thinking OFF.
+
+Ported from VadimBir/OGAM-Fixed de880edd7.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0189a4fmQMdffzzMCg5BpSDJ
+---
+ __tests__/unit/services/llm.test.ts | 24 ++++++++++++++++++++++++
+ src/services/llm.ts                 | 10 +++++++++-
+ 2 files changed, 33 insertions(+), 1 deletion(-)
+
+diff --git a/__tests__/unit/services/llm.test.ts b/__tests__/unit/services/llm.test.ts
+index 48ee71908..2b8f129fb 100644
+--- a/__tests__/unit/services/llm.test.ts
++++ b/__tests__/unit/services/llm.test.ts
+@@ -2045,6 +2045,30 @@ describe('LLMService', () => {
+       expect(result).toBe('Hello world');
+     });
+ 
++    it('turns thinking off for the internal pass even when chat thinking is on', async () => {
++      mockedRNFS.exists.mockResolvedValue(true);
++      const ctx = createMockLlamaContext({
++        completion: jest.fn().mockImplementation((_params, cb) => {
++          cb({ token: 'web_search' });
++          return Promise.resolve({ timings: {} });
++        }),
++      });
++      mockedInitLlama.mockResolvedValue(ctx as any);
++      await llmService.loadModel('/models/test.gguf');
++      useAppStore.getState().updateSettings({ thinkingEnabled: true });
++
++      try {
++        await llmService.generateWithMaxTokens([{ id: '1', role: 'user', content: 'route this', timestamp: 0 }], 64);
++      } finally {
++        useAppStore.getState().updateSettings({ thinkingEnabled: false });
++      }
++
++      expect(ctx.completion).toHaveBeenCalledWith(
++        expect.objectContaining({ n_predict: 64, enable_thinking: false, reasoning_format: 'none' }),
++        expect.any(Function),
++      );
++    });
++
+     it('never releases the context under a completion that was still being set up', async () => {
+       mockedRNFS.exists.mockResolvedValue(true);
+       const events: string[] = [];
+diff --git a/src/services/llm.ts b/src/services/llm.ts
+index f9d04705b..fed915124 100644
+--- a/src/services/llm.ts
++++ b/src/services/llm.ts
+@@ -552,7 +552,15 @@ class LLMService {
+       );
+       const { settings } = useAppStore.getState();
+       const cr = await safeCompletion(ctx, () => ctx.completion(
+-        { messages: oaiMessages, ...buildCompletionParams(settings, { disableCtxShift: this.shouldDisableCtxShift() }), n_predict: maxTokens },
++        // Internal pass (summary, tool routing): thinking is always off. Without these params
++        // llama.rn applies enable_thinking=true, and a reasoning model spends the whole n_predict
++        // (64 for tool routing) inside <think>, whatever the chat's Thinking toggle says.
++        {
++          messages: oaiMessages,
++          ...buildCompletionParams(settings, { disableCtxShift: this.shouldDisableCtxShift() }),
++          n_predict: maxTokens,
++          ...buildThinkingCompletionParams(false, this.isGemma4Model()),
++        },
+         (data) => { if (this.isGenerating && data.token) fullResponse += data.token; },
+       ), 'generateWithMaxTokens');
+       this.recordCompletionEnd(cr);
+-- 
+2.43.0
+

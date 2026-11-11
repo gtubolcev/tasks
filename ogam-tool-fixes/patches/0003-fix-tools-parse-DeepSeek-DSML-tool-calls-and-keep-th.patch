@@ -1,0 +1,224 @@
+From f966f7e7acebbb1250ee8109ad6256ab7281d848 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 11 Nov 2026 11:22:37 +0000
+Subject: [PATCH 3/6] fix(tools): parse DeepSeek DSML tool calls and keep them
+ out of the chat
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+DeepSeek models wrap native tool-call tags in a DSML token written with
+fullwidth bars (<｜DSML｜invoke name="f"><｜DSML｜parameter name="k"
+string="true">). When a server does not parse them, or on the tool-limit
+final turn where the tools are dropped, they arrived as plain text: the text
+parser did not recognise them, so the call never ran and the raw markup was
+shown in the chat.
+
+- messageContent: normalizeDsmlToolCalls() reduces DSML tags to plain
+  <invoke>/<parameter>; DSML blocks and stray DSML tags join the streaming
+  control-token patterns so they are not shown while streaming.
+- parseToolCallsFromText normalises DSML first; <invoke>/<parameter> accept
+  extra attributes (string="true"); containsToolCallMarkup detects DSML.
+- Tool-limit final answer: when the model's reply strips to nothing (markup
+  only), show the completed tool results instead of "(No response)".
+
+Ported from fl4p/off-grid-ai-mobile 3c58b8f77 / 3f39fc319 (Fabian), adapted to
+the current tool loop.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0189a4fmQMdffzzMCg5BpSDJ
+---
+ .../generationToolLoop.branches.test.ts       | 20 ++++++++++++++
+ __tests__/unit/utils/messageContent.test.ts   | 20 +++++++++++++-
+ src/services/generationToolLoop.ts            | 21 +++++++++++----
+ src/utils/messageContent.ts                   | 26 +++++++++++++++++++
+ 4 files changed, 81 insertions(+), 6 deletions(-)
+
+diff --git a/__tests__/unit/services/generationToolLoop.branches.test.ts b/__tests__/unit/services/generationToolLoop.branches.test.ts
+index cc79d8b35..9a54bea2d 100644
+--- a/__tests__/unit/services/generationToolLoop.branches.test.ts
++++ b/__tests__/unit/services/generationToolLoop.branches.test.ts
+@@ -112,6 +112,26 @@ describe('parseToolCallsFromText — invoke & namespaced blocks', () => {
+     expect(result.toolCalls).toHaveLength(1);
+     expect(result.toolCalls[0].name).toBe('web_search');
+   });
++
++  it('parses DeepSeek DSML-wrapped tool calls and strips them from the text', () => {
++    const dsml =
++      'Let me look.\n<｜DSML｜function_calls>\n' +
++      '<｜DSML｜invoke name="web_search">\n' +
++      '<｜DSML｜parameter name="query" string="true">weather Paris</｜DSML｜parameter>\n' +
++      '</｜DSML｜invoke>\n</｜DSML｜function_calls>';
++    const result = parse(dsml);
++
++    expect(result.toolCalls).toHaveLength(1);
++    expect(result.toolCalls[0].name).toBe('web_search');
++    expect(result.toolCalls[0].arguments).toEqual({ query: 'weather Paris' });
++    expect(result.cleanText).toBe('Let me look.');
++  });
++
++  it('accepts the doubled-bar DSML spelling', () => {
++    const result = parse('<｜｜DSML｜｜invoke name="read_url"><｜｜DSML｜｜parameter name="url">https://x.com</｜｜DSML｜｜parameter></｜｜DSML｜｜invoke>');
++    expect(result.toolCalls[0]).toMatchObject({ name: 'read_url', arguments: { url: 'https://x.com' } });
++    expect(result.cleanText).toBe('');
++  });
+ });
+ 
+ // ===========================================================================
+diff --git a/__tests__/unit/utils/messageContent.test.ts b/__tests__/unit/utils/messageContent.test.ts
+index 90d1df621..607bf0d27 100644
+--- a/__tests__/unit/utils/messageContent.test.ts
++++ b/__tests__/unit/utils/messageContent.test.ts
+@@ -6,7 +6,11 @@
+  * Priority: P0 (Critical) - Prevents raw control tokens from appearing in chat.
+  */
+ 
+-import { stripControlTokens, templateEmitsReasoning } from '../../../src/utils/messageContent';
++import {
++  stripControlTokens,
++  stripStreamingControlTokens,
++  templateEmitsReasoning,
++} from '../../../src/utils/messageContent';
+ 
+ describe('templateEmitsReasoning', () => {
+   it('returns false for null/undefined/empty template', () => {
+@@ -258,3 +262,17 @@ describe('stripControlTokens', () => {
+     });
+   });
+ });
++
++describe('stripStreamingControlTokens — DeepSeek DSML tool calls', () => {
++  it('removes a whole DSML tool-call block from the live text', () => {
++    const text =
++      'Checking.\n<｜DSML｜function_calls>\n<｜DSML｜invoke name="web_search">\n' +
++      '<｜DSML｜parameter name="query" string="true">x</｜DSML｜parameter>\n' +
++      '</｜DSML｜invoke>\n</｜DSML｜function_calls>\nDone.';
++    expect(stripStreamingControlTokens(text)).toBe('Checking.\nDone.');
++  });
++
++  it('removes the tags of a block that has not closed yet', () => {
++    expect(stripStreamingControlTokens('Hi <｜DSML｜function_calls>\n<｜DSML｜invoke name="a">')).toBe('Hi ');
++  });
++});
+diff --git a/src/services/generationToolLoop.ts b/src/services/generationToolLoop.ts
+index e298be612..4e914bf8a 100644
+--- a/src/services/generationToolLoop.ts
++++ b/src/services/generationToolLoop.ts
+@@ -26,6 +26,8 @@ import logger from '../utils/logger';
+ import {
+   XML_TOOL_CALL_FUNCTION_MARKER,
+   XML_TOOL_CALL_PARAMETER_MARKER,
++  hasDsmlMarkup,
++  normalizeDsmlToolCalls,
+ } from '../utils/messageContent';
+ import {
+   callsWithinToolBudget,
+@@ -251,18 +253,19 @@ function parseGemmaNativeToolCalls(text: string): {
+   return { cleanText: cleanText.trim(), toolCalls };
+ }
+ 
+-/** Parse <invoke name="fn"><parameter name="k">v</parameter></invoke> blocks (minimax, Anthropic-style). */
++/** Parse <invoke name="fn"><parameter name="k">v</parameter></invoke> blocks (minimax, Anthropic-style).
++ *  `[^>]*` after the name tolerates extra attributes, e.g. DeepSeek's `string="true"`. */
+ function parseInvokeBlocks(
+   text: string,
+   toolCalls: ToolCall[],
+   matchedRanges: [number, number][],
+ ): void {
+-  const invokePattern = /<invoke\s+name="([^"]+)">([\s\S]*?)<\/invoke>/g;
++  const invokePattern = /<invoke\s+name="([^"]+)"[^>]*>([\s\S]*?)<\/invoke>/g;
+   let match;
+   while ((match = invokePattern.exec(text)) !== null) {
+     const name = match[1];
+     const args: Record<string, any> = {};
+-    const paramPattern = /<parameter\s+name="([^"]+)">([\s\S]*?)<\/parameter>/g;
++    const paramPattern = /<parameter\s+name="([^"]+)"[^>]*>([\s\S]*?)<\/parameter>/g;
+     let pm;
+     while ((pm = paramPattern.exec(match[2])) !== null) {
+       args[pm[1]] = pm[2].trim();
+@@ -277,10 +280,12 @@ function parseInvokeBlocks(
+ }
+ 
+ /** Parse tool calls from text output (fallback for small models). Supports JSON, XML, and invoke formats. */
+-export function parseToolCallsFromText(text: string): {
++export function parseToolCallsFromText(rawText: string): {
+   cleanText: string;
+   toolCalls: ToolCall[];
+ } {
++  // DeepSeek's DSML-wrapped tags reduce to the standard <invoke>/<parameter> forms.
++  const text = normalizeDsmlToolCalls(rawText);
+   const toolCalls: ToolCall[] = [];
+   const matchedRanges: [number, number][] = [];
+ 
+@@ -1119,6 +1124,7 @@ function containsToolCallMarkup(text: string): boolean {
+   return (
+     text.includes('<tool_call>') ||
+     text.includes('<invoke') ||
++    hasDsmlMarkup(text) ||
+     /\w+:tool_call/.test(text) ||
+     text.includes('<function_call>')
+   );
+@@ -1258,10 +1264,15 @@ async function emitToolLimitFinalAnswer(
+     return { interrupted: true };
+   }
+   const { displayResponse } = resolveToolCalls(fullResponse, []);
++  // Some remote models (DeepSeek family) ignore "no tools" and answer the forced final turn
++  // with tool-call markup only, which strips to nothing. Fall back to the gathered results
++  // rather than "(No response)".
+   emitFinalResponse(
+     ctx,
+     state,
+-    displayResponse,
++    displayResponse.trim()
++      ? displayResponse
++      : finalResponseFromToolResults('', state.successfulToolResults),
+   );
+   return { interrupted: false };
+ }
+diff --git a/src/utils/messageContent.ts b/src/utils/messageContent.ts
+index 8dd5c166f..af9b67594 100644
+--- a/src/utils/messageContent.ts
++++ b/src/utils/messageContent.ts
+@@ -55,6 +55,29 @@ const XML_TOOL_CALL_BLOCK_PATTERN = new RegExp(
+   'gi',
+ );
+ 
++// DeepSeek (V3.2+) wraps its native tool-call tags in a DSML special token written with
++// fullwidth vertical bars: `<｜DSML｜function_calls><｜DSML｜invoke name="f"><｜DSML｜parameter
++// name="k" string="true">v</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜function_calls>`.
++// When a server does not parse them (or the tools were dropped for a final answer) they
++// reach the text verbatim.
++const DSML_MARKER_PATTERN = /｜{1,2}DSML｜{1,2}/g;
++const DSML_BLOCK_PATTERN =
++  /<｜{1,2}DSML｜{1,2}(function_calls|tool_calls|invoke)\b[\s\S]*?<\/｜{1,2}DSML｜{1,2}\1>\s*/g;
++const DSML_STRAY_TAG_PATTERN = /<\/?｜{1,2}DSML｜{1,2}[^>]*>\s*/g;
++
++/** Whether text carries DeepSeek DSML tool-call markup. */
++export function hasDsmlMarkup(text: string): boolean {
++  return text.includes('DSML｜');
++}
++
++/** Reduce DSML-wrapped tags to the plain `<invoke>` / `<parameter>` forms the text parser reads. */
++export function normalizeDsmlToolCalls(text: string): string {
++  if (!hasDsmlMarkup(text)) return text;
++  return text
++    .replace(DSML_MARKER_PATTERN, '')
++    .replace(/<\/?(?:function_calls|tool_calls)>\s*/g, '');
++}
++
+ /**
+  * Length of the longest suffix of `text` that is a PREFIX of `tag` — i.e. how much of a possibly-
+  * incomplete tag is dangling at the end of a stream chunk, so the incremental parsers can hold it
+@@ -80,6 +103,9 @@ const CONTROL_TOKEN_PATTERNS: RegExp[] = [
+   ...TOOL_CALL_BLOCK_PATTERNS,
+   // XML-style `<function=…>…</function>` tool-call blocks (the extractor's second grammar).
+   XML_TOOL_CALL_BLOCK_PATTERN,
++  // DeepSeek DSML tool-call blocks, then any stray DSML tag left by a truncated block.
++  DSML_BLOCK_PATTERN,
++  DSML_STRAY_TAG_PATTERN,
+   // Gemma 4 string-delimiter token that may appear outside a tool block
+   /<\|">/g,
+ ];
+-- 
+2.43.0
+

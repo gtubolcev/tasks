@@ -1,0 +1,157 @@
+From c49e5d074ae78bddf6fabdcb10c9945a95c2d5c8 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 11 Nov 2026 11:18:35 +0000
+Subject: [PATCH 1/6] fix(remote): accumulate streamed tool calls by index
+
+OpenAI-compatible servers stream parallel tool calls interleaved and keyed by
+`index` (index 0 frag, index 1 frag, index 0 frag, ...). processToolCallChunk
+started a new call only when an `id` arrived and appended every other argument
+fragment to the last call, so models that emit several calls at once (GLM,
+Kimi K2) got two calls' JSON concatenated into one and the turn failed on
+JSON.parse ("Unexpected end of JSON input").
+
+Accumulate per index. A different id at an index that already has a call still
+starts a new call (servers that reuse index 0 with a fresh id per call), and
+fragments without an index keep the old id / last-call behaviour.
+
+Ported from fl4p/off-grid-ai-mobile a781199d8 (Fabian), adjusted for the
+index-0-reuse case.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0189a4fmQMdffzzMCg5BpSDJ
+---
+ .../providers/openAICompatibleStream.test.ts  | 40 ++++++++++++++++
+ .../providers/openAICompatibleStream.ts       | 48 +++++++++++++++----
+ .../providers/openAICompatibleTypes.ts        |  2 +
+ 3 files changed, 80 insertions(+), 10 deletions(-)
+
+diff --git a/__tests__/unit/services/providers/openAICompatibleStream.test.ts b/__tests__/unit/services/providers/openAICompatibleStream.test.ts
+index f9cdd33fe..131d2465f 100644
+--- a/__tests__/unit/services/providers/openAICompatibleStream.test.ts
++++ b/__tests__/unit/services/providers/openAICompatibleStream.test.ts
+@@ -195,6 +195,46 @@ describe('processDelta', () => {
+     expect(state.currentToolCall?.function?.arguments).toBe('{"city":"NY"}');
+   });
+ 
++  it('accumulates interleaved parallel tool calls by index without mixing their arguments', () => {
++    // GLM / Kimi stream several tool calls INTERLEAVED by index; keying off the last call
++    // concatenated both calls' JSON into one ("Unexpected end of JSON input").
++    const state = makeState();
++    const { thinkTagParser, callbacks } = makeCtx();
++    const run = (tool_calls: any[]) => processDelta({ tool_calls }, state, { thinkingEnabled: true, callbacks, thinkTagParser });
++    run([{ index: 0, id: 'call-a', type: 'function', function: { name: 'web_search', arguments: '' } }]);
++    run([{ index: 1, id: 'call-b', type: 'function', function: { name: 'read_url', arguments: '' } }]);
++    run([{ index: 0, function: { arguments: '{"query":"a' } }]);
++    run([{ index: 1, function: { arguments: '{"url":"b' } }]);
++    run([{ index: 0, function: { arguments: '"}' } }]);
++    run([{ index: 1, function: { arguments: '"}' } }]);
++
++    expect(state.toolCalls).toHaveLength(2);
++    expect(state.toolCalls[0]).toMatchObject({ id: 'call-a', function: { name: 'web_search', arguments: '{"query":"a"}' } });
++    expect(state.toolCalls[1]).toMatchObject({ id: 'call-b', function: { name: 'read_url', arguments: '{"url":"b"}' } });
++  });
++
++  it('takes the id from a later fragment of the same index', () => {
++    const state = makeState();
++    const { thinkTagParser, callbacks } = makeCtx();
++    const run = (tool_calls: any[]) => processDelta({ tool_calls }, state, { thinkingEnabled: true, callbacks, thinkTagParser });
++    run([{ index: 0, function: { name: 'web_search', arguments: '{"q":' } }]);
++    run([{ index: 0, id: 'late-id', function: { arguments: '"x"}' } }]);
++    expect(state.toolCalls).toHaveLength(1);
++    expect(state.toolCalls[0]).toMatchObject({ id: 'late-id', function: { arguments: '{"q":"x"}' } });
++  });
++
++  it('starts a new call when a server reuses index 0 with a fresh id per call', () => {
++    const state = makeState();
++    const { thinkTagParser, callbacks } = makeCtx();
++    const run = (tool_calls: any[]) => processDelta({ tool_calls }, state, { thinkingEnabled: true, callbacks, thinkTagParser });
++    run([{ index: 0, id: 'call-1', type: 'function', function: { name: 'web_search', arguments: '{"query":"a"}' } }]);
++    run([{ index: 0, id: 'call-2', type: 'function', function: { name: 'web_search', arguments: '{"query":"b"}' } }]);
++    expect(state.toolCalls.map(c => [c.id, c.function.arguments])).toEqual([
++      ['call-1', '{"query":"a"}'],
++      ['call-2', '{"query":"b"}'],
++    ]);
++  });
++
+   it('suppresses think-tag reasoning when thinkingEnabled=false', () => {
+     const state = makeState();
+     const { thinkTagParser, callbacks, onReasoning, onToken } = makeCtx(false);
+diff --git a/src/services/providers/openAICompatibleStream.ts b/src/services/providers/openAICompatibleStream.ts
+index 1bce12c9a..ec9e8789e 100644
+--- a/src/services/providers/openAICompatibleStream.ts
++++ b/src/services/providers/openAICompatibleStream.ts
+@@ -136,20 +136,48 @@ type DeltaShape = {
+   }>;
+ };
+ 
++function startToolCall(state: OpenAIStreamState, id: string): OpenAIToolCall {
++  const call: OpenAIToolCall = { id, type: 'function', function: { name: '', arguments: '' } };
++  state.toolCalls.push(call);
++  return call;
++}
++
++/**
++ * Pick the call a streamed fragment belongs to.
++ * OpenAI streams parallel tool calls INTERLEAVED and keyed by `index` (index 0 frag, index 1
++ * frag, index 0 frag, …). Keying off "new id = new call, everything else appends to the last
++ * call" concatenated two calls' JSON arguments (GLM, Kimi K2 → "Unexpected end of JSON input").
++ * Some OpenAI-compatible servers reuse index 0 for every call but send a fresh id per call,
++ * so a DIFFERENT id at a known index still starts a new call. Without an index, fall back
++ * to the id / last-call behaviour.
++ */
++function toolCallForChunk(
++  tc: NonNullable<DeltaShape['tool_calls']>[0],
++  state: OpenAIStreamState,
++): OpenAIToolCall | undefined {
++  if (typeof tc.index === 'number') {
++    const slots = (state.toolCallsByIndex ??= {});
++    const existing = slots[tc.index];
++    if (!existing || (tc.id && existing.id && tc.id !== existing.id)) {
++      slots[tc.index] = startToolCall(state, tc.id || '');
++    } else if (tc.id && !existing.id) {
++      existing.id = tc.id;
++    }
++    return slots[tc.index];
++  }
++  if (tc.id) return startToolCall(state, tc.id);
++  return (state.currentToolCall as OpenAIToolCall | null) ?? undefined;
++}
++
+ function processToolCallChunk(
+   tc: NonNullable<DeltaShape['tool_calls']>[0],
+   state: OpenAIStreamState,
+ ): void {
+-  if (tc.id) {
+-    state.currentToolCall = { id: tc.id, type: 'function', function: { name: '', arguments: '' } };
+-    state.toolCalls.push(state.currentToolCall as OpenAIToolCall);
+-  }
+-  if (tc.function?.name && state.currentToolCall?.function) {
+-    state.currentToolCall.function.name = tc.function.name;
+-  }
+-  if (tc.function?.arguments && state.currentToolCall?.function) {
+-    state.currentToolCall.function.arguments += tc.function.arguments;
+-  }
++  const target = toolCallForChunk(tc, state);
++  state.currentToolCall = target ?? null;
++  if (!target?.function) return;
++  if (tc.function?.name) target.function.name = tc.function.name;
++  if (tc.function?.arguments) target.function.arguments += tc.function.arguments;
+ }
+ 
+ /**
+diff --git a/src/services/providers/openAICompatibleTypes.ts b/src/services/providers/openAICompatibleTypes.ts
+index 81d8d53e0..d9c70e47c 100644
+--- a/src/services/providers/openAICompatibleTypes.ts
++++ b/src/services/providers/openAICompatibleTypes.ts
+@@ -47,6 +47,8 @@ export interface OpenAIStreamState {
+   reasoningDetails?: Array<Record<string, unknown>>;
+   toolCalls: OpenAIToolCall[];
+   currentToolCall: Partial<OpenAIToolCall> | null;
++  /** Streamed tool calls by their `index`, so interleaved parallel calls stay separate. */
++  toolCallsByIndex?: Record<number, OpenAIToolCall>;
+   completeCalled: boolean;
+   streamErrorOccurred: boolean;
+ }
+-- 
+2.43.0
+

@@ -1,0 +1,181 @@
+From 1cfe3deb8e3b158376caba4358083d2e28423a4c Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 11 Nov 2026 11:24:21 +0000
+Subject: [PATCH 4/6] feat(tools): tell a model with no tools that it has none
+
+With no tools in the request, a model answers "run this" or "what tools do you
+have" from its training and says it ran the code or made the plot, although
+nothing ran. When the turn has no built-in tools and no MCP/extension tools,
+append one sentence to the system prompt: it has no tools, so it should give
+code or steps for the user instead. It is one sentence because small local
+models can have a 4k context.
+
+buildPromptWithToolNote() in the registry now owns the turn's tool line (text
+hint, no-tools note, or nothing) for both send and regenerate.
+
+Ported from fl4p/off-grid-ai-mobile 68a62a632 + 56944410f (Fabian).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0189a4fmQMdffzzMCg5BpSDJ
+---
+ .../unit/services/tools/registry.test.ts      | 28 +++++++++++++++++++
+ .../ChatScreen/useChatGenerationActions.ts    | 22 ++++++++++-----
+ src/services/index.ts                         |  2 +-
+ src/services/tools/index.ts                   |  2 +-
+ src/services/tools/registry.ts                | 23 +++++++++++++++
+ 5 files changed, 68 insertions(+), 9 deletions(-)
+
+diff --git a/__tests__/unit/services/tools/registry.test.ts b/__tests__/unit/services/tools/registry.test.ts
+index 776dd10b7..e38451376 100644
+--- a/__tests__/unit/services/tools/registry.test.ts
++++ b/__tests__/unit/services/tools/registry.test.ts
+@@ -9,6 +9,8 @@ import {
+   AVAILABLE_TOOLS,
+   getToolsAsOpenAISchema,
+   buildToolSystemPromptHint,
++  buildPromptWithToolNote,
++  NO_TOOLS_NOTE,
+ } from '../../../../src/services/tools/registry';
+ 
+ describe('Tool Registry', () => {
+@@ -161,4 +163,30 @@ describe('Tool Registry', () => {
+       expect(hint).toContain('date and time');
+     });
+   });
++
++  // ========================================================================
++  // buildPromptWithToolNote
++  // ========================================================================
++  describe('buildPromptWithToolNote', () => {
++    it('tells a model with no tools at all that it has none', () => {
++      const prompt = buildPromptWithToolNote('Base.', { activeToolIds: [], useTextHint: false, hasExtensionTools: false });
++      expect(prompt).toBe(`Base.${NO_TOOLS_NOTE}`);
++    });
++
++    it('adds no note when only MCP/extension tools are enabled', () => {
++      const prompt = buildPromptWithToolNote('Base.', { activeToolIds: [], useTextHint: false, hasExtensionTools: true });
++      expect(prompt).toBe('Base.');
++    });
++
++    it('adds nothing when native tool calling carries the tools', () => {
++      const prompt = buildPromptWithToolNote('Base.', { activeToolIds: ['calculator'], useTextHint: false, hasExtensionTools: false });
++      expect(prompt).toBe('Base.');
++    });
++
++    it('adds the text hint, not the note, when the engine lacks native tool calling', () => {
++      const prompt = buildPromptWithToolNote('Base.', { activeToolIds: ['calculator'], useTextHint: true, hasExtensionTools: false });
++      expect(prompt).toBe(`Base.${buildToolSystemPromptHint(['calculator'])}`);
++      expect(prompt).not.toContain(NO_TOOLS_NOTE);
++    });
++  });
+ });
+diff --git a/src/screens/ChatScreen/useChatGenerationActions.ts b/src/screens/ChatScreen/useChatGenerationActions.ts
+index 6a236269c..a35e2cbc3 100644
+--- a/src/screens/ChatScreen/useChatGenerationActions.ts
++++ b/src/screens/ChatScreen/useChatGenerationActions.ts
+@@ -14,7 +14,7 @@ import {
+   generationService,
+   imageGenerationService,
+   ImageGenerationState,
+-  buildToolSystemPromptHint,
++  buildPromptWithToolNote,
+   contextCompactionService,
+ } from '../../services';
+ import { getToolExtensions } from '../../services/tools/extensions';
+@@ -551,6 +551,10 @@ async function prepareContext(
+   }
+ }
+ /** Compact before the prompt budget is full; keep the context-full retry as a fallback. */
++/** MCP/extension tools reach the model through the tool loop, outside settings.enabledTools. */
++function hasEnabledExtensionTools(): boolean {
++  return getToolExtensions().some(e => e.enabledToolCount() > 0);
++}
+ async function generateWithCompactionRetry(
+   opts: {
+     id: string;
+@@ -824,9 +828,11 @@ export async function startGenerationFn(
+   // the hint lands in the system prompt twice. Only the built-in-tools text hint is
+   // added here, and only when the model lacks native Jinja tool calling.
+   const systemPrompt = applyGemma4ThinkToken(
+-    useTextHint
+-      ? `${basePrompt}${buildToolSystemPromptHint(activeTools)}`
+-      : basePrompt,
++    buildPromptWithToolNote(basePrompt, {
++      activeToolIds: activeTools,
++      useTextHint,
++      hasExtensionTools: hasEnabledExtensionTools(),
++    }),
+     deps.activeModel,
+     { isRemote },
+   );
+@@ -1400,9 +1406,11 @@ export async function regenerateResponseFn(
+   // MCP/extension hints come solely from augmentSystemPromptForTools in the tool loop
+   // (see the send path above) — adding them here too would double-inject.
+   const systemPrompt = applyGemma4ThinkToken(
+-    useTextHint
+-      ? `${rawPrompt}${buildToolSystemPromptHint(activeTools)}`
+-      : rawPrompt,
++    buildPromptWithToolNote(rawPrompt, {
++      activeToolIds: activeTools,
++      useTextHint,
++      hasExtensionTools: hasEnabledExtensionTools(),
++    }),
+     deps.activeModel,
+     { isRemote },
+   );
+diff --git a/src/services/index.ts b/src/services/index.ts
+index cbe316db5..88804164f 100644
+--- a/src/services/index.ts
++++ b/src/services/index.ts
+@@ -14,7 +14,7 @@ export { generationService } from './generationService';
+ export type { QueuedMessage } from './generationService';
+ export { imageGenerationService } from './imageGenerationService';
+ export type { ImageGenerationState } from './imageGenerationService';
+-export { buildToolSystemPromptHint } from './tools';
++export { buildToolSystemPromptHint, buildPromptWithToolNote } from './tools';
+ export { contextCompactionService } from './contextCompaction';
+ export { knowledgeBase } from './rag';
+ // Providers
+diff --git a/src/services/tools/index.ts b/src/services/tools/index.ts
+index e9550e439..dc7f9341e 100644
+--- a/src/services/tools/index.ts
++++ b/src/services/tools/index.ts
+@@ -1,3 +1,3 @@
+ ;
+-export { offeredTools, getToolsAsOpenAISchema, buildToolSystemPromptHint } from './registry';
++export { offeredTools, getToolsAsOpenAISchema, buildToolSystemPromptHint, buildPromptWithToolNote, NO_TOOLS_NOTE } from './registry';
+ export { executeToolCall } from './handlers';
+diff --git a/src/services/tools/registry.ts b/src/services/tools/registry.ts
+index 85d43506b..52f02d577 100644
+--- a/src/services/tools/registry.ts
++++ b/src/services/tools/registry.ts
+@@ -168,3 +168,26 @@ export function buildToolSystemPromptHint(enabledToolIds: string[]): string {
+   const toolList = enabledTools.map(t => `- ${t.name}: ${t.description}`).join('\n');
+   return `\n\nTools available:\n${toolList}\nUse these tools proactively and precisely — call the right tool at the right moment rather than guessing or saying you cannot help.`;
+ }
++
++/**
++ * One sentence for a turn where the model has no tools at all. Without it a tool-less model
++ * answers "run this" / "what can you do" from training priors and claims it ran code or made
++ * a plot. Kept to one sentence: small local models can have a 4k context.
++ */
++export const NO_TOOLS_NOTE =
++  '\n\nYou have no tools in this chat: you cannot run code, browse, or read files. Do not pretend to; give code or steps for the user to run instead.';
++
++/**
++ * The system prompt's tool line for this turn: the built-in tools text hint when the engine
++ * lacks native tool calling, the no-tools note when the model gets no tools at all, otherwise
++ * nothing (native schemas carry the tools; MCP/extension hints are added by the tool loop).
++ * `hasExtensionTools` counts MCP/extension tools, which are not in activeToolIds.
++ */
++export function buildPromptWithToolNote(
++  basePrompt: string,
++  opts: { activeToolIds: string[]; useTextHint: boolean; hasExtensionTools: boolean },
++): string {
++  if (opts.useTextHint) return `${basePrompt}${buildToolSystemPromptHint(opts.activeToolIds)}`;
++  if (opts.activeToolIds.length === 0 && !opts.hasExtensionTools) return `${basePrompt}${NO_TOOLS_NOTE}`;
++  return basePrompt;
++}
+-- 
+2.43.0
+

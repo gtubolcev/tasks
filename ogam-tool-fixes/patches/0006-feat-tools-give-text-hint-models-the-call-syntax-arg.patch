@@ -1,0 +1,101 @@
+From 6f629beef19f70149d49aa71ed8f14fb0a9b8393 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 11 Nov 2026 11:26:49 +0000
+Subject: [PATCH 6/6] feat(tools): give text-hint models the call syntax,
+ arguments and an example
+
+On a llama model without native (Jinja) tool calling the system prompt is the
+only place the model learns about tools, and it listed just "- name:
+description". Small models then did not know the argument names or the call
+format, or concluded they could not act. The hint now states the exact
+<tool_call>{"name", "arguments"}</tool_call> form that parseToolCallsFromText
+reads, each argument with its type / required / enum, and one literal example
+per tool.
+
+Ported from VadimBir/OGAM-Fixed 64a5008ba (text-hint part only).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0189a4fmQMdffzzMCg5BpSDJ
+---
+ .../unit/services/tools/registry.test.ts      |  8 ++++
+ src/services/tools/registry.ts                | 41 ++++++++++++++++++-
+ 2 files changed, 47 insertions(+), 2 deletions(-)
+
+diff --git a/__tests__/unit/services/tools/registry.test.ts b/__tests__/unit/services/tools/registry.test.ts
+index e38451376..d4c62732b 100644
+--- a/__tests__/unit/services/tools/registry.test.ts
++++ b/__tests__/unit/services/tools/registry.test.ts
+@@ -162,6 +162,14 @@ describe('Tool Registry', () => {
+       expect(hint).toContain('get_current_datetime');
+       expect(hint).toContain('date and time');
+     });
++
++    it('spells out the call syntax, the arguments and a parseable example per tool', () => {
++      const hint = buildToolSystemPromptHint(['calculator']);
++      expect(hint).toContain('<tool_call>{"name": "TOOL_NAME", "arguments": {"ARG": "VALUE"}}</tool_call>');
++      expect(hint).toContain('expression (string, required) — Math expression');
++      const example = /example: <tool_call>(.*)<\/tool_call>/.exec(hint);
++      expect(JSON.parse(example![1])).toEqual({ name: 'calculator', arguments: { expression: '...' } });
++    });
+   });
+ 
+   // ========================================================================
+diff --git a/src/services/tools/registry.ts b/src/services/tools/registry.ts
+index 52f02d577..4c0749592 100644
+--- a/src/services/tools/registry.ts
++++ b/src/services/tools/registry.ts
+@@ -161,12 +161,49 @@ export function getToolsAsOpenAISchema(enabledToolIds: readonly string[]) {
+   );
+ }
+ 
++/** `name (type, required) — description` lines, so a text-hint model knows the argument names. */
++function toolParameterLines(tool: ToolDefinition): string {
++  return Object.entries(tool.parameters)
++    .map(([key, p]) => {
++      const traits = [p.type, p.required ? 'required' : '', p.enum ? `one of: ${p.enum.join('|')}` : '']
++        .filter(Boolean)
++        .join(', ');
++      return `    ${key} (${traits}) — ${p.description}`;
++    })
++    .join('\n');
++}
++
++/** A literal call in the form parseToolCallsFromText reads: <tool_call>{"name","arguments"}. */
++function toolCallExample(tool: ToolDefinition): string {
++  const args = Object.fromEntries(
++    Object.entries(tool.parameters)
++      .filter(([, p]) => p.required)
++      .map(([key, p]) => [key, p.enum?.[0] ?? (p.type === 'integer' || p.type === 'number' ? 1 : '...')]),
++  );
++  return `<tool_call>${JSON.stringify({ name: tool.name, arguments: args })}</tool_call>`;
++}
++
++/**
++ * Tool list for an engine without native tool calling. The model sees only this text, so it
++ * carries the call syntax, every argument and a literal example per tool; a bare
++ * "- name: description" list left small models unsure how to call a tool, or sure they could not.
++ */
+ export function buildToolSystemPromptHint(enabledToolIds: string[]): string {
+   const enabledTools = offeredTools().filter(t => enabledToolIds.includes(t.id));
+   if (enabledTools.length === 0) return '';
+ 
+-  const toolList = enabledTools.map(t => `- ${t.name}: ${t.description}`).join('\n');
+-  return `\n\nTools available:\n${toolList}\nUse these tools proactively and precisely — call the right tool at the right moment rather than guessing or saying you cannot help.`;
++  const toolList = enabledTools
++    .map(t => {
++      const params = toolParameterLines(t);
++      return `- ${t.name}: ${t.description}\n${params ? `  arguments:\n${params}\n` : ''}  example: ${toolCallExample(t)}`;
++    })
++    .join('\n');
++  return (
++    '\n\nTools available. To call one, reply with exactly\n' +
++    '<tool_call>{"name": "TOOL_NAME", "arguments": {"ARG": "VALUE"}}</tool_call>\n' +
++    'and nothing else; the result comes back in the next message.\n' +
++    `${toolList}\nUse these tools proactively and precisely — call the right tool at the right moment rather than guessing or saying you cannot help.`
++  );
+ }
+ 
+ /**
+-- 
+2.43.0
+

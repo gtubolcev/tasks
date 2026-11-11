@@ -1,0 +1,257 @@
+From a1b9e263f7c55de8ff1d00fe1e5d0d846288d06c Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 11 Nov 2026 11:19:59 +0000
+Subject: [PATCH 2/6] fix(tools): close read_url SSRF gaps (userinfo, IPv6,
+ CGNAT, redirects)
+
+isPrivateUrl took the host with a regex over the raw string, so
+`http://user:pass@10.0.0.1/` was judged by "user" and fetched. It also missed
+IPv6 private ranges, IPv4-mapped IPv6, 100.64.0.0/10 (CGNAT / Tailscale peers),
+.local/.internal names, and anything reached through a redirect.
+
+- Move the guard to tools/privateUrl.ts and read the host from the URL parser
+  (react-native-url-polyfill is loaded in index.js), which also normalises
+  shorthand IPv4 such as http://2130706433/.
+- Block loopback, RFC 1918, link-local/metadata, CGNAT, multicast/reserved,
+  ::, ::1, fc00::/7, fe80::/10, ::ffff:<private v4>, cloud metadata hosts,
+  .localhost/.local/.internal/.lan/.home.arpa, single-label names, non-http(s)
+  schemes and unparsable URLs.
+- After fetch, refuse the body when response.url landed on a private address.
+
+Based on fl4p/off-grid-ai-mobile 216c73494 (userinfo, CGNAT) and
+longregen/off-grid-mobile-ai f417b1a8c (IPv6, metadata hosts, suffixes); the
+redirect check is new.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0189a4fmQMdffzzMCg5BpSDJ
+---
+ .../unit/services/tools/handlers.test.ts      | 14 +++
+ .../unit/services/tools/privateUrl.test.ts    | 52 ++++++++++++
+ src/services/tools/handlers.ts                | 15 ++--
+ src/services/tools/privateUrl.ts              | 85 +++++++++++++++++++
+ 4 files changed, 157 insertions(+), 9 deletions(-)
+ create mode 100644 __tests__/unit/services/tools/privateUrl.test.ts
+ create mode 100644 src/services/tools/privateUrl.ts
+
+diff --git a/__tests__/unit/services/tools/handlers.test.ts b/__tests__/unit/services/tools/handlers.test.ts
+index 7286fefcb..4cfaa05f0 100644
+--- a/__tests__/unit/services/tools/handlers.test.ts
++++ b/__tests__/unit/services/tools/handlers.test.ts
+@@ -446,11 +446,25 @@ describe('Tool Handlers', () => {
+       ['10.x.x.x',         'http://10.0.0.1/api'],     // NOSONAR
+       ['172.16.x.x',       'http://172.16.0.1/api'],   // NOSONAR
+       ['169.254.x.x',      'http://169.254.1.1/meta'],  // NOSONAR
++      ['userinfo before a private host', 'http://user:pass@10.0.0.1/'], // NOSONAR
++      ['CGNAT / Tailscale', 'http://100.100.100.100/'], // NOSONAR
+     ])('blocks %s addresses', async (_label, url) => {
+       const result = await runTool('read_url', { url });
+       expect(result.error).toContain('Blocked');
+     });
+ 
++    it('refuses the body when a public URL redirects to a private address', async () => {
++      (globalThis as any).fetch = jest.fn().mockResolvedValue({
++        ok: true,
++        status: 200,
++        url: 'http://169.254.169.254/latest/meta-data/', // NOSONAR
++        text: jest.fn().mockResolvedValue('<p>secret</p>'),
++      });
++      const result = await runTool('read_url', { url: 'https://example.com/redirect' });
++      expect(result.error).toContain('Blocked');
++      expect(result.content ?? '').not.toContain('secret');
++    });
++
+     it('strips leading angle bracket from URL', async () => {
+       (globalThis as any).fetch = jest.fn().mockResolvedValue({
+         ok: true,
+diff --git a/__tests__/unit/services/tools/privateUrl.test.ts b/__tests__/unit/services/tools/privateUrl.test.ts
+new file mode 100644
+index 000000000..fcb4dab98
+--- /dev/null
++++ b/__tests__/unit/services/tools/privateUrl.test.ts
+@@ -0,0 +1,52 @@
++/**
++ * read_url's SSRF guard: the host comes from the URL parser, so userinfo, shorthand IPv4
++ * and IPv6 spellings cannot carry a private address past it.
++ */
++import { isPrivateUrl } from '../../../../src/services/tools/privateUrl';
++
++describe('isPrivateUrl', () => {
++  it.each([
++    'http://localhost:8080/',
++    'http://127.0.0.1/',
++    'http://10.1.2.3/',
++    'http://172.31.255.255/',
++    'http://192.168.0.1/',
++    'http://169.254.169.254/latest/meta-data/',
++    'http://100.64.0.1/',
++    'http://100.127.255.254/',
++    'http://0.0.0.0/',
++    'http://user:pass@10.0.0.1/',
++    'http://example.com@127.0.0.1/',
++    'http://2130706433/',
++    'http://0x7f.0.0.1/',
++    'http://[::1]/',
++    'http://[::]/',
++    'http://[fd00::1]/',
++    'http://[fe80::1]/',
++    'http://[::ffff:127.0.0.1]/',
++    'http://[::ffff:a9fe:a9fe]/',
++    'http://metadata.google.internal/',
++    'http://printer.local/',
++    'http://app.localhost/',
++    'http://nas/',
++    'file:///etc/passwd',
++    'ftp://example.com/',
++    'not a url',
++  ])('blocks %s', url => {
++    expect(isPrivateUrl(url)).toBe(true);
++  });
++
++  it.each([
++    'https://example.com/',
++    'https://user@example.com/',
++    'http://100.63.255.255/',
++    'http://100.128.0.1/',
++    'http://172.15.0.1/',
++    'http://172.32.0.1/',
++    'https://8.8.8.8/',
++    'https://[2606:4700:4700::1111]/',
++    'https://localhost.example.com/',
++  ])('allows %s', url => {
++    expect(isPrivateUrl(url)).toBe(false);
++  });
++});
+diff --git a/src/services/tools/handlers.ts b/src/services/tools/handlers.ts
+index fc3fc42da..47ed68906 100644
+--- a/src/services/tools/handlers.ts
++++ b/src/services/tools/handlers.ts
+@@ -3,6 +3,7 @@ import { Platform } from 'react-native';
+ import DeviceInfo from 'react-native-device-info';
+ import { describeTurnStatus } from '@offgrid/rag/documents';
+ import { ToolCall, ToolResult } from './types';
++import { isPrivateUrl } from './privateUrl';
+ import { useDocumentTurnStatusStore } from '../documents/progressStore';
+ import type * as DocumentChatTurn from '../documents/chatTurn';
+ import logger from '../../utils/logger';
+@@ -347,15 +348,6 @@ async function handleGetDeviceInfo(infoType = 'all'): Promise<string> {
+   return parts.join('\n\n');
+ }
+ 
+-/** Block SSRF: reject private/loopback/link-local/cloud-metadata URLs. */
+-function isPrivateUrl(url: string): boolean {
+-  const m = url.match(/^https?:\/\/([^/:]+)/i);
+-  if (!m) return false;
+-  const h = m[1].toLowerCase();
+-  return h === 'localhost' || h === '[::1]' || h === 'metadata.google.internal'
+-    || /^(127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|0\.|169\.254\.)/.test(h);
+-}
+-
+ function nodeToText(node: any): string {
+   if (node.nodeType === 3) return node.text ?? '';
+   const tag = (node.tagName ?? '').toLowerCase();
+@@ -426,6 +418,11 @@ async function handleReadUrl(rawUrl: string): Promise<string> {
+         Accept: 'text/html, text/plain, */*',
+       },
+     });
++    // fetch follows redirects on its own, so a public URL can bounce to a private one
++    // (e.g. a 302 to the cloud-metadata address). Check where it actually landed.
++    if (response.url && isPrivateUrl(response.url)) {
++      throw new Error('Blocked: the URL redirected to a private/local network address');
++    }
+     if (!response.ok) throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+     const html = await response.text();
+     const text = htmlToMarkdown(html);
+diff --git a/src/services/tools/privateUrl.ts b/src/services/tools/privateUrl.ts
+new file mode 100644
+index 000000000..754f2236d
+--- /dev/null
++++ b/src/services/tools/privateUrl.ts
+@@ -0,0 +1,85 @@
++/**
++ * SSRF guard for tools that fetch a URL the model chose (read_url).
++ *
++ * The host is taken from the URL parser, never from a regex on the raw string: a regex
++ * reading "everything after //" sees `user` in `http://user@10.0.0.1/` and lets a private
++ * host through. The WHATWG parser (react-native-url-polyfill) also normalises the
++ * shorthand IPv4 forms (`http://2130706433/`, `http://0x7f.1/`) to dotted quads.
++ */
++
++const BLOCKED_HOSTS = new Set([
++  'localhost',
++  'metadata.google.internal',
++  'metadata.goog',
++  'metadata.azure.com',
++  'instance-data',
++]);
++
++const BLOCKED_SUFFIXES = ['.localhost', '.local', '.internal', '.lan', '.home.arpa'];
++
++function ipv4Octets(host: string): number[] | null {
++  const parts = host.split('.');
++  if (parts.length !== 4 || !parts.every(p => /^\d{1,3}$/.test(p))) return null;
++  const octets = parts.map(Number);
++  return octets.every(o => o <= 255) ? octets : null;
++}
++
++function isPrivateIpv4([a, b]: number[]): boolean {
++  return a === 0                                // "this network"
++    || a === 10                                 // RFC 1918
++    || a === 127                                // loopback
++    || (a === 100 && b >= 64 && b <= 127)       // CGNAT / Tailscale (100.64.0.0/10)
++    || (a === 169 && b === 254)                 // link-local, cloud metadata
++    || (a === 172 && b >= 16 && b <= 31)        // RFC 1918
++    || (a === 192 && b === 168)                 // RFC 1918
++    || (a === 198 && (b === 18 || b === 19))    // benchmarking (198.18.0.0/15)
++    || a >= 224;                                // multicast, reserved, broadcast
++}
++
++/** `::ffff:7f00:1` / `::ffff:127.0.0.1` → [127, 0, 0, 1]; anything else → null. */
++function ipv4FromMappedIpv6(host: string): number[] | null {
++  const m = /^(?:0{0,4}:){0,5}:?ffff:(.+)$/i.exec(host);
++  if (!m) return null;
++  const tail = m[1];
++  const dotted = ipv4Octets(tail);
++  if (dotted) return dotted;
++  const hex = /^([0-9a-f]{1,4}):([0-9a-f]{1,4})$/i.exec(tail);
++  if (!hex) return null;
++  const hi = parseInt(hex[1], 16);
++  const lo = parseInt(hex[2], 16);
++  return [hi >> 8, hi & 0xff, lo >> 8, lo & 0xff];
++}
++
++function isPrivateIpv6(host: string): boolean {
++  const h = host.toLowerCase();
++  if (h === '::' || h === '::1') return true;              // unspecified, loopback
++  const mapped = ipv4FromMappedIpv6(h);
++  if (mapped) return isPrivateIpv4(mapped);
++  const first = parseInt(h.split(':')[0] || '0', 16);
++  return (first & 0xfe00) === 0xfc00                       // unique local fc00::/7
++    || (first & 0xffc0) === 0xfe80                         // link-local fe80::/10
++    || (first & 0xff00) === 0xff00;                        // multicast ff00::/8
++}
++
++/**
++ * True when the URL must not be fetched: unparsable, not http(s), or pointing at
++ * loopback / private / link-local / CGNAT / cloud-metadata / local-only names.
++ */
++export function isPrivateUrl(url: string): boolean {
++  let parsed: URL;
++  try {
++    parsed = new URL(url);
++  } catch {
++    return true;
++  }
++  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return true;
++
++  const host = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, '').replace(/\.$/, '');
++  if (!host) return true;
++  if (BLOCKED_HOSTS.has(host) || BLOCKED_SUFFIXES.some(s => host.endsWith(s))) return true;
++  if (host.includes(':')) return isPrivateIpv6(host);
++  const octets = ipv4Octets(host);
++  if (octets) return isPrivateIpv4(octets);
++  // A single-label name (no dot) only resolves on the local network ("router", "nas").
++  return !host.includes('.');
++}
+-- 
+2.43.0
+
